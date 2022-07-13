@@ -1,102 +1,90 @@
-Mix.install([
-  :jason,
-  :ecto_sql,
-  :postgrex,
-  :flow
-])
+##########################################################################################
+# REPRO SETUP
+###########################################################################################
 
-defmodule Scenario.Repo do
+Mix.install([:jason, :ecto_sql, :postgrex, :flow])
+
+defmodule Repo do
   use Ecto.Repo, otp_app: :scenario, adapter: Ecto.Adapters.Postgres
 end
 
-defmodule Scenario.SetupMigration do
+defmodule SetupMigration do
   use Ecto.Migration
 
-  def up do
-    create table(:products) do
+  def change do
+    create table(:posts) do
+      add(:title, :string)
+    end
+
+    create(unique_index(:posts, [:title]))
+
+    create table(:tags) do
       add(:name, :string)
-
-      timestamps()
     end
-    
-    create(unique_index(:products, [:name]))
-    
-    create table(:configs) do
-      add(:lines, :string)
-
-      timestamps()
-    end
-  end
-
-  def down do
-    drop(table("products"))
-    drop(table("configs"))
   end
 end
 
-Application.put_env(:scenario, Scenario.Repo,
+Application.put_env(:scenario, Repo,
   url: "ecto://postgres:postgres@localhost/scenario",
   pool: Ecto.Adapters.SQL.Sandbox,
   log: false
 )
 
-defmodule Scenario.Product do
+defmodule Post do
   use Ecto.Schema
 
-  schema "products" do
+  schema "posts" do
+    field(:title, :string)
+  end
+end
+
+defmodule Tag do
+  use Ecto.Schema
+
+  schema "tags" do
     field(:name, :string)
-
-    timestamps()
   end
 end
 
-defmodule Scenario.Config do
-  use Ecto.Schema
+_ = Ecto.Adapters.Postgres.storage_down(Repo.config())
 
-  schema "configs" do
-    field(:lines, :string)
+:ok = Ecto.Adapters.Postgres.storage_up(Repo.config())
 
-    timestamps()
-  end
-end
+{:ok, _pid} = Repo.start_link()
 
-_ = Ecto.Adapters.Postgres.storage_down(Scenario.Repo.config())
+:ok = Ecto.Migrator.up(Repo, 0, SetupMigration, log: false)
 
-:ok = Ecto.Adapters.Postgres.storage_up(Scenario.Repo.config())
+##########################################################################################
+# REPRO SCENARIO
+###########################################################################################
+defmodule Scenario do
+  def run do
+    tag = Repo.insert!(%Tag{})
 
-{:ok, _pid} = Scenario.Repo.start_link()
+    changeset =
+      %Post{title: "123"}
+      |> Ecto.Changeset.change()
+      |> Ecto.Changeset.unique_constraint([:title])
 
-:ok = Ecto.Migrator.up(Scenario.Repo, 0, Scenario.SetupMigration, log: false)
+    # INSERT THE POST FIRST SO IT TRIGGERS THE CONSTRAINT AFTER
+    Repo.insert(changeset)
 
-defmodule Main do
-  import Ecto.Changeset
-  
-  def main do
-    config = Scenario.Repo.insert!(%Scenario.Config{})
-    
-    changeset = Ecto.Changeset.change(%Scenario.Product{name: "123"}) |> unique_constraint([:name])
-    
-    Scenario.Repo.insert(changeset)
-
-    Scenario.Repo.transaction(fn repo ->
+    Repo.transaction(fn repo ->
+      # TRIES TO INSERT THE POST AGAIN AND SINCE THIS IS NOT AN UNHANDLED EXCEPTION
+      # IT SHOULD NOT GENERATE A ROLLBACK (OR SHOULD IT!?)
       case repo.insert(changeset) do
-        {:ok, product} ->
-          IO.inspect(product, label: "PRODUCT OK")
+        {:ok, post} ->
+          IO.inspect(post, label: "POST")
 
-        {:error, reason} ->
-          IO.inspect(reason, label: "REASON")
+        {:error, changeset} ->
+          IO.inspect(changeset, label: "CHANGESET")
 
-          # mirror =
-          #   mirror
-          #   |> Map.put(:status, {:error, attrs})
-          #   |> Map.put(:errors, errors)
-
-          config_changeset = Ecto.Changeset.change(config, %{lines: "update"})
-
-          repo.update(config_changeset)
+          tag
+          |> Ecto.Changeset.change(%{name: "failed"})
+          |> repo.update()
       end
     end)
   end
 end
 
-Main.main
+Scenario.run()
